@@ -1,39 +1,63 @@
-from fastapi import FastAPI, Query
-from pydantic import BaseModel
-from typing import List, Optional
+# agents/scraping_agent/main.py (Modified)
 import requests
-from bs4 import BeautifulSoup
+from fastapi import FastAPI, HTTPException, Query, status
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
 
-app = FastAPI(title="Scraping Agent")
+# Import the loader function
+from data_ingestion.scraping_loader import (
+    get_earnings_surprises,
+    FMPError,
+)  # Import custom error
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Scraping Agent (FMP Earnings)")
 
 
 class FilingRequest(BaseModel):
     ticker: str
-    filing_type: Optional[str] = "earnings"
-    start_date: Optional[str] = None
-    end_date: Optional[str] = None
-
-
-def fetch_yahoo_earnings(ticker):
-    url = f"https://finance.yahoo.com/quote/{ticker}/financials"
-    resp = requests.get(url)
-    soup = BeautifulSoup(resp.text, "html.parser")
-    # This is a placeholder: Actual parsing will depend on Yahoo's HTML structure
-    tables = soup.find_all("table")
-    if tables:
-        return tables[0].text
-    return "No data found"
+    filing_type: Optional[str] = "earnings_surprise"  # Matches supported type
+    start_date: Optional[str] = None  # Not directly used by current loader
+    end_date: Optional[str] = None  # Not directly used by current loader
 
 
 @app.post("/get_filings")
 def get_filings(request: FilingRequest):
-    # For demo: Only supports Yahoo Finance earnings
-    if request.filing_type == "earnings":
-        data = fetch_yahoo_earnings(request.ticker)
+    """
+    Fetches filings (earnings surprise) by calling the data_ingestion layer.
+    """
+    if request.filing_type != "earnings_surprise":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only 'earnings_surprise' filing_type supported in demo, received '{request.filing_type}'.",
+        )
+
+    try:
+        # Call the loader function from data_ingestion
+        earnings_data_list = get_earnings_surprises(request.ticker)
+
+        # The loader handles API calls and basic error checking.
+        # The agent now just formats the response structure.
         return {
             "ticker": request.ticker,
             "filing_type": request.filing_type,
-            "data": data,
+            "data": earnings_data_list,  # This is the list returned by the loader
         }
-    else:
-        return {"error": "Only earnings filings supported in demo."}
+
+    except (requests.exceptions.RequestException, FMPError) as e:
+        # Catch exceptions raised by the loader
+        error_msg = f"Error fetching filings for {request.ticker}: {e}"
+        logger.error(error_msg)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=error_msg
+        )
+    except Exception as e:
+        error_msg = f"An unexpected error occurred processing {request.ticker}: {e}"
+        logger.error(error_msg)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=error_msg
+        )

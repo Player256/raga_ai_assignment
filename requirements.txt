@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+pydantic
+requests
+python-dotenv
+numpy
+faiss-cpu  # Or faiss-gpu if you have CUDA
+sentence-transformers
+langchain>=0.1.0
+langchain-core
+langchain-community # For FAISS integration
+langchain-openai
+gtts
+faster-whisper
+python-multipart # Needed for file uploads in FastAPI
+langgraph
