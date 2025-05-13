@@ -2,7 +2,7 @@
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Dict
+from typing import List, Dict, Optional
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer

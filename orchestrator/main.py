@@ -146,7 +146,6 @@ async def api_agent_node(state: MarketBriefState) -> MarketBriefState:
         payload = {
             "tickers": [
                 "TSM",
-                "005930.KS",
             ],  # Example tickers (TSM for TSMC US ADR, 005930.KS for Samsung Korea)
             "start_date": None,  # Handled by API agent implementation
             "end_date": None,  # Handled by API agent implementation
@@ -182,7 +181,7 @@ async def scraping_agent_node(state: MarketBriefState) -> MarketBriefState:
     """Calls the Scraping Agent to fetch filings (earnings)."""
     async with httpx.AsyncClient() as client:
         # Fetch filings for example tickers - match API agent tickers
-        tickers = ["TSM", "005930.KS"]
+        tickers = ["TSM"]
         filings_data = {}
         for ticker in tickers:
             payload = {
@@ -353,9 +352,8 @@ async def analysis_agent_node(state: MarketBriefState) -> MarketBriefState:
         # Example portfolio - ideally from config or user context
         portfolio_example = {
             "TSM": 0.12,
-            "005930.KS": 0.10,
         }  # Use tickers matching API agent
-        asia_tech_tickers_example = ["TSM", "005930.KS"]
+        asia_tech_tickers_example = ["TSM"]
 
         # Prepare earnings data for analysis agent - need to map ticker -> List[record_dict]
         earnings_for_analysis = {}
@@ -601,7 +599,7 @@ async def market_brief(audio: UploadFile = File(...)):
     )
     try:
         # The graph will process the state through the nodes
-        final_state = await graph.invoke(initial_state)
+        final_state = await graph.ainvoke(initial_state)
         logger.info("LangGraph execution finished.")
 
     except HTTPException as e:
