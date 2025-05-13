@@ -1,24 +1,21 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, status
 from pydantic import BaseModel
-import httpx  # Use async http client
+import httpx
 import os
 from dotenv import load_dotenv
-from langgraph.graph import StateGraph, END  # Use END for clarity
-from typing import Dict, List, Optional, Any
+from langgraph.graph import StateGraph, END
+from typing import Dict, List, Optional, Any, Union
 import logging
+import json
 
-# Load environment variables
 load_dotenv()
-
-# Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Orchestrator")
+app = FastAPI(title="Orchestrator (Generalized)")
 
-# --- Configuration: Agent URLs from Environment Variables ---
 AGENT_API_URL = os.getenv("AGENT_API_URL", "http://localhost:8001")
 AGENT_SCRAPING_URL = os.getenv("AGENT_SCRAPING_URL", "http://localhost:8002")
 AGENT_RETRIEVER_URL = os.getenv("AGENT_RETRIEVER_URL", "http://localhost:8003")
@@ -27,62 +24,95 @@ AGENT_LANGUAGE_URL = os.getenv("AGENT_LANGUAGE_URL", "http://localhost:8005")
 AGENT_VOICE_URL = os.getenv("AGENT_VOICE_URL", "http://localhost:8006")
 
 
-# --- State Definition ---
-# Added error handling fields to the state
+class EarningsSurpriseRecordState(BaseModel):
+    date: str
+    symbol: str
+    actual: Union[float, int, str, None] = None
+    estimate: Union[float, int, str, None] = None
+    difference: Union[float, int, str, None] = None
+    surprisePercentage: Union[float, int, str, None] = None
+
+
 class MarketBriefState(BaseModel):
     audio_input: Optional[bytes] = None
     user_text: Optional[str] = None
-    market_data: Optional[Dict[str, Dict[str, float]]] = (
-        None  # Matches refactored API Agent output
-    )
-    filings: Optional[Dict[str, List[Dict[str, Any]]]] = (
-        None  # Matches refactored Scraping Agent output (list of records)
-    )
+    nlu_results: Optional[Dict[str, str]] = None
+
+    target_tickers_for_data_fetch: List[str] = []
+    market_data: Optional[Dict[str, Dict[str, float]]] = None
+    filings: Optional[Dict[str, List[EarningsSurpriseRecordState]]] = None
+
     indexed: bool = False
-    retrieved_docs: Optional[List[str]] = None  # List of document content strings
-    analysis: Optional[Dict[str, Any]] = (
-        None  # Matches refactored Analysis Agent output structure
-    )
+    retrieved_docs: Optional[List[str]] = None
+    analysis: Optional[Dict[str, Any]] = None
     brief: Optional[str] = None
     audio_output: Optional[bytes] = None
-    # Error tracking fields
     errors: List[str] = []
     warnings: List[str] = []
 
     class Config:
-        arbitrary_types_allowed = True  # Allow bytes in state
+        arbitrary_types_allowed = True
 
 
-# Helper function to call agents and handle errors
+EXAMPLE_PORTFOLIO_FILE = "example_portfolio.json"
+EXAMPLE_METADATA_FILE = "example_metadata.json"
+
+
+def load_example_data(file_path: str, default_data: Dict) -> Dict:
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Could not load {file_path}: {e}. Using default.")
+    return default_data
+
+
+EXAMPLE_PORTFOLIO = load_example_data(
+    EXAMPLE_PORTFOLIO_FILE,
+    {
+        "TSM": {
+            "weight": 0.22,
+            "country": "Taiwan",
+            "sector": "Technology",
+        },
+        "AAPL": {"weight": 0.15, "country": "USA", "sector": "Technology"},
+        "MSFT": {"weight": 0.10, "country": "USA", "sector": "Technology"},
+        "JNJ": {"weight": 0.08, "country": "USA", "sector": "Healthcare"},
+        "BABA": {
+            "weight": 0.05,
+            "country": "China",
+            "sector": "Technology",
+        },
+    },
+)
+
+
 async def call_agent(
     client: httpx.AsyncClient,
     url: str,
     method: str = "post",
     json_payload: Optional[Dict] = None,
     files_payload: Optional[Dict] = None,
+    timeout: float = 60.0,
 ) -> Dict:
-    """Makes an asynchronous call to an agent and handles HTTP errors."""
     try:
-        logger.info(f"Calling agent at {url}...")
+        logger.info(
+            f"Calling agent at {url} with payload keys: {list(json_payload.keys()) if json_payload else 'N/A'}"
+        )
         if method == "post":
             if json_payload:
-                response = await client.post(
-                    url, json=json_payload, timeout=60.0
-                )  # Add timeout
+                response = await client.post(url, json=json_payload, timeout=timeout)
             elif files_payload:
-                response = await client.post(
-                    url, files=files_payload, timeout=60.0
-                )  # Add timeout
+                response = await client.post(url, files=files_payload, timeout=timeout)
             else:
-                raise ValueError(
-                    "Must provide either json_payload or files_payload for POST."
-                )
+                raise ValueError("POST request requires json_payload or files_payload.")
         elif method == "get":
-            response = await client.get(url, timeout=60.0)  # Add timeout
+            response = await client.get(url, params=json_payload, timeout=timeout)
         else:
             raise ValueError(f"Unsupported method: {method}")
 
-        response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
+        response.raise_for_status()
         logger.info(f"Agent at {url} returned status {response.status_code}.")
         return response.json()
 
@@ -95,448 +125,405 @@ async def call_agent(
     except httpx.RequestError as e:
         error_msg = f"Request error calling agent at {url}: {e}"
         logger.error(error_msg)
-        # Catch potential client-side errors like timeouts
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=error_msg
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail=error_msg
         )
     except httpx.HTTPStatusError as e:
-        error_msg = f"HTTP error calling agent at {url}: {e.response.status_code} - {e.response.text}"
+        error_msg = f"HTTP error calling agent at {url}: {e.response.status_code} - {e.response.text[:200]}"
         logger.error(error_msg)
-        # Catch bad status codes from the agent itself
-        raise HTTPException(status_code=e.response.status_code, detail=error_msg)
+        raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
     except Exception as e:
         error_msg = f"An unexpected error occurred calling agent at {url}: {e}"
-        logger.error(error_msg)
-        # Catch any other unexpected errors
+        logger.error(error_msg, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=error_msg
         )
-
-
-# --- Agent Node Functions (Async) ---
 
 
 async def stt_node(state: MarketBriefState) -> MarketBriefState:
-    """Calls the Voice Agent for Speech-to-Text."""
+
     async with httpx.AsyncClient() as client:
+        if not state.audio_input:
+            state.errors.append("STT Node: No audio input provided.")
+            logger.error(state.errors[-1])
+            state.user_text = "Error: No audio provided for STT."
+            return state
         files = {"audio": ("input.wav", state.audio_input, "audio/wav")}
-        # Use the helper function for robust calls
-        response_data = await call_agent(
-            client, f"{AGENT_VOICE_URL}/stt", files_payload=files
+        try:
+            response_data = await call_agent(
+                client, f"{AGENT_VOICE_URL}/stt", files_payload=files
+            )
+            if "transcript" in response_data:
+                state.user_text = response_data["transcript"]
+                logger.info(f"STT successful. Transcript: {state.user_text[:50]}...")
+            else:
+                error_msg = f"STT agent response missing 'transcript': {response_data}"
+                logger.error(error_msg)
+                state.errors.append(error_msg)
+                state.user_text = "Error: STT failed."
+        except HTTPException as e:
+            state.errors.append(f"STT Node failed: {e.detail}")
+            state.user_text = "Error: STT service unavailable or failed."
+    return state
+
+
+async def nlu_node(state: MarketBriefState) -> MarketBriefState:
+    """(NEW) Calls an NLU process (simulated here) to extract intent."""
+    if not state.user_text or "Error:" in state.user_text:
+        state.warnings.append(
+            "NLU Node: Skipping due to missing or error in user_text."
+        )
+        state.nlu_results = {
+            "region": "Global",
+            "sector": "Overall Portfolio",
+        }
+        return state
+
+    logger.info(f"NLU Node: Processing query: '{state.user_text}'")
+
+    query_lower = state.user_text.lower()
+    region = "Global"
+    sector = "Overall Portfolio"
+
+    if "asia" in query_lower and "tech" in query_lower:
+        region = "Asia"
+        sector = "Technology"
+        logger.info("NLU Simulation: Detected 'Asia' and 'Tech'.")
+    elif "us" in query_lower or "usa" in query_lower or "america" in query_lower:
+        region = "USA"
+        if "tech" in query_lower:
+            sector = "Technology"
+        elif "health" in query_lower:
+            sector = "Healthcare"
+        logger.info(f"NLU Simulation: Detected Region '{region}', Sector '{sector}'.")
+
+    state.nlu_results = {"region": region, "sector": sector}
+    logger.info(f"NLU Node: Results: {state.nlu_results}")
+
+    target_tickers = []
+    portfolio_keys = list(EXAMPLE_PORTFOLIO.keys())
+
+    if region == "Global" and (
+        sector == "Overall Portfolio" or sector == "Overall Market"
+    ):
+        target_tickers = portfolio_keys
+    else:
+        for ticker, details in EXAMPLE_PORTFOLIO.items():
+            matches_region = region == "Global"
+            if region == "Asia" and details.get("country") in [
+                "Taiwan",
+                "China",
+                "Korea",
+                "Japan",
+                "India",
+            ]:
+                matches_region = True
+            elif region == "USA" and details.get("country") == "USA":
+                matches_region = True
+
+            matches_sector = sector == "Overall Portfolio" or sector == "Overall Market"
+            if sector.lower() == details.get("sector", "").lower():
+                matches_sector = True
+
+            if matches_region and matches_sector:
+                target_tickers.append(ticker)
+
+    if not target_tickers and portfolio_keys:
+        logger.warning(
+            f"NLU filtering yielded no specific tickers for {region}/{sector}, defaulting to all portfolio tickers."
+        )
+        target_tickers = portfolio_keys
+        state.nlu_results["region_effective"] = "Global"
+        state.nlu_results["sector_effective"] = "Overall Portfolio"
+
+    state.target_tickers_for_data_fetch = list(set(target_tickers))
+    logger.info(
+        f"NLU Node: Target tickers for data fetch: {state.target_tickers_for_data_fetch}"
+    )
+    if not state.target_tickers_for_data_fetch:
+        state.warnings.append(
+            "NLU Node: No target tickers identified for data fetching based on query and portfolio."
         )
 
-        # Validate and update state
-        if "transcript" in response_data:
-            state.user_text = response_data["transcript"]
-            logger.info(f"STT successful. Transcript: {state.user_text[:50]}...")
-        else:
-            error_msg = f"STT agent response missing 'transcript': {response_data}"
-            logger.error(error_msg)
-            state.errors.append(error_msg)
-            # Optionally, raise HTTPException if transcript is essential for next steps
-            # raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="STT failed to return transcript.")
-
-        return state
+    return state
 
 
 async def api_agent_node(state: MarketBriefState) -> MarketBriefState:
-    """Calls the API Agent to fetch market data."""
-    async with httpx.AsyncClient() as client:
-        # Example tickers - ideally these might come from user query analysis or config
-        payload = {
-            "tickers": [
-                "TSM",
-            ],  # Example tickers (TSM for TSMC US ADR, 005930.KS for Samsung Korea)
-            "start_date": None,  # Handled by API agent implementation
-            "end_date": None,  # Handled by API agent implementation
-            "data_type": "close",  # Handled by API agent implementation
-        }
-        response_data = await call_agent(
-            client, f"{AGENT_API_URL}/get_market_data", json_payload=payload
+    if not state.target_tickers_for_data_fetch:
+        state.warnings.append(
+            "API Agent Node: No target tickers to fetch market data for. Skipping."
         )
+        state.market_data = {}
+        return state
 
-        # Validate and update state
-        if "result" in response_data:
-            state.market_data = response_data["result"]
-            logger.info(
-                f"API Agent successful. Fetched data for tickers: {list(state.market_data.keys())}"
+    async with httpx.AsyncClient() as client:
+        payload = {
+            "tickers": state.target_tickers_for_data_fetch,
+            "data_type": "adjClose",
+        }
+        try:
+            response_data = await call_agent(
+                client, f"{AGENT_API_URL}/get_market_data", json_payload=payload
             )
-            # Check for potential errors reported by the agent itself
+            state.market_data = response_data.get("result", {})
+            logger.info(
+                f"API Agent successful. Fetched data for tickers: {list(state.market_data.keys()) if state.market_data else 'None'}"
+            )
             if response_data.get("errors"):
                 state.warnings.append(
                     f"API Agent reported errors: {response_data['errors']}"
                 )
-                logger.warning(state.warnings[-1])
-        else:
-            error_msg = f"API Agent response missing 'result': {response_data}"
-            logger.error(error_msg)
-            state.errors.append(error_msg)
-            # Optionally, raise HTTPException if market data is essential
-            # raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="API Agent failed to return market data.")
+            if response_data.get("warnings"):
+                state.warnings.extend(response_data.get("warnings", []))
 
-        return state
+        except HTTPException as e:
+            state.errors.append(
+                f"API Agent Node failed for tickers {state.target_tickers_for_data_fetch}: {e.detail}"
+            )
+            state.market_data = {}
+    return state
 
 
 async def scraping_agent_node(state: MarketBriefState) -> MarketBriefState:
-    """Calls the Scraping Agent to fetch filings (earnings)."""
+    if not state.target_tickers_for_data_fetch:
+        state.warnings.append(
+            "Scraping Agent Node: No target tickers to fetch earnings for. Skipping."
+        )
+        state.filings = {}
+        return state
+
     async with httpx.AsyncClient() as client:
-        # Fetch filings for example tickers - match API agent tickers
-        tickers = ["TSM"]
-        filings_data = {}
-        for ticker in tickers:
-            payload = {
-                "ticker": ticker,
-                "filing_type": "earnings_surprise",
-            }  # Matches refactored Scraping Agent
+        filings_data: Dict[str, List[Dict[str, Any]]] = {}
+        for ticker in state.target_tickers_for_data_fetch:
+            payload = {"ticker": ticker, "filing_type": "earnings_surprise"}
             try:
                 response_data = await call_agent(
                     client, f"{AGENT_SCRAPING_URL}/get_filings", json_payload=payload
                 )
-                # The refactored scraping agent returns a dict with 'ticker', 'filing_type', 'data' (list), and optionally 'error'
-                if "data" in response_data:
-                    filings_data[ticker] = (
-                        response_data  # Store the whole response for the ticker
-                    )
+
+                if "data" in response_data and isinstance(response_data["data"], list):
+
+                    filings_data[ticker] = response_data["data"]
                     logger.info(
-                        f"Scraping Agent successful for {ticker}. Records: {len(response_data.get('data', []))}"
+                        f"Scraping Agent got {len(response_data['data'])} records for {ticker}."
                     )
-                    if response_data.get("error"):
-                        state.warnings.append(
-                            f"Scraping Agent reported error for {ticker}: {response_data['error']}"
+                    if not response_data["data"]:
+                        logger.info(
+                            f"Scraping Agent for {ticker} returned 0 earnings surprise records."
                         )
-                        logger.warning(state.warnings[-1])
                 else:
-                    error_msg = f"Scraping Agent response for {ticker} missing 'data': {response_data}"
-                    logger.error(error_msg)
-                    state.errors.append(error_msg)
-            except (HTTPException, Exception) as e:
-                # Catch exceptions raised by call_agent for this specific ticker
-                error_msg = f"Error fetching filings for {ticker}: {e.detail if isinstance(e, HTTPException) else str(e)}"
-                logger.error(error_msg)
-                state.errors.append(error_msg)
-                # Don't necessarily stop if one ticker fails, try others
-
+                    filings_data[ticker] = []
+                    state.errors.append(
+                        f"Scraping agent for {ticker} returned malformed data: {str(response_data)[:100]}"
+                    )
+            except HTTPException as e:
+                state.errors.append(
+                    f"Scraping Agent Node failed for {ticker}: {e.detail}"
+                )
+                filings_data[ticker] = []
         state.filings = filings_data
-        # Decide if failure to get *any* filings is critical
-        if not state.filings:
-            state.errors.append("Failed to retrieve filings for any ticker.")
-            # Optionally, raise HTTPException here if needed
-            # raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve any filings.")
-
-        return state
+    return state
 
 
 async def retriever_agent_node(state: MarketBriefState) -> MarketBriefState:
-    """Calls the Retriever Agent to index and retrieve documents."""
+
     async with httpx.AsyncClient() as client:
-        # --- Index Filings ---
-        # Extract document content from the refactored scraping agent output
-        # Need to format this nicely for indexing. Let's just use the raw 'data' string from the old agent
-        # OR format the structured data from the new agent into a string.
-        # Let's assume the new scraping agent structure: Dict[ticker, List[record_dict]]
-        # We need to decide what 'documents' to index. The raw FMP data isn't ideal text.
-        # A better approach would be to use a DocumentLoader or format the relevant parts.
-        # For this demo, let's just stringify the relevant parts of the earnings data.
         docs_to_index = []
         if state.filings:
-            for ticker, filing_response in state.filings.items():
-                # Use the 'data' list from the filing response
-                records = filing_response.get("data", [])
-                if records:
-                    # Simple formatting: include ticker and relevant record data
-                    # You might want more sophisticated document creation here
-                    doc_content = f"Earnings data for {ticker}:\n" + "\n".join(
+            for (
+                ticker,
+                records_list,
+            ) in state.filings.items():
+                if records_list:
+                    doc_content = f"Earnings surprise data for {ticker}:\n" + "\n".join(
                         [
-                            f"Date: {r.get('date')}, Actual: {r.get('actual')}, Estimate: {r.get('estimate')}, Surprise%: {r.get('surprisePercentage')}"
-                            for r in records
+                            f"Date: {r.get('date', 'N/A')}, Symbol: {r.get('symbol', 'N/A')}, "
+                            f"Actual: {r.get('actual', 'N/A')}, Estimate: {r.get('estimate', 'N/A')}, "
+                            f"Surprise%: {r.get('surprisePercentage', 'N/A')}"
+                            for r in records_list
                         ]
                     )
                     docs_to_index.append(doc_content)
-                else:
-                    logger.warning(
-                        f"No data records found in filings for {ticker} to index."
-                    )
-                    state.warnings.append(
-                        f"No data records found in filings for {ticker} to index."
-                    )
 
         if docs_to_index:
             try:
-                index_response = await call_agent(
-                    client,
-                    f"{AGENT_RETRIEVER_URL}/index",
-                    json_payload={"docs": docs_to_index},
-                )
-                if index_response.get("status") == "indexed":
-                    state.indexed = True
-                    logger.info(
-                        f"Retriever Agent indexing successful. Indexed {index_response.get('num_docs')} documents."
-                    )
-                else:
-                    error_msg = f"Retriever Agent indexing reported non-indexed status: {index_response}"
-                    logger.error(error_msg)
-                    state.errors.append(error_msg)
-            except (HTTPException, Exception) as e:
-                error_msg = f"Error during Retriever Agent indexing: {e.detail if isinstance(e, HTTPException) else str(e)}"
-                logger.error(error_msg)
-                state.errors.append(error_msg)
-                # Proceed to retrieval even if indexing failed, the agent might use a cached index
 
-        # --- Retrieve Relevant Docs ---
-        # Retrieval requires the user query. If STT failed, we can't retrieve.
-        if (
-            state.user_text and state.indexed
-        ):  # Only retrieve if we have a query and indexing was attempted/successful
-            try:
-                payload = {"query": state.user_text, "top_k": 2}
-                retrieve_response = await call_agent(
-                    client, f"{AGENT_RETRIEVER_URL}/retrieve", json_payload=payload
-                )
-
-                if "results" in retrieve_response:
-                    # Extract just the document content strings
-                    state.retrieved_docs = [
-                        r["doc"] for r in retrieve_response["results"]
-                    ]
-                    logger.info(
-                        f"Retriever Agent retrieval successful. Retrieved {len(state.retrieved_docs)} documents."
-                    )
-                elif (
-                    "error" in retrieve_response
-                ):  # Handle agent-specific error like "No documents indexed"
-                    error_msg = f"Retriever Agent retrieval returned error: {retrieve_response['error']}"
-                    logger.warning(error_msg)
-                    state.warnings.append(error_msg)
-                    state.retrieved_docs = (
-                        []
-                    )  # Ensure it's an empty list on retrieval error
-                else:
-                    error_msg = f"Retriever Agent retrieval response missing 'results' or 'error': {retrieve_response}"
-                    logger.error(error_msg)
-                    state.errors.append(error_msg)
-                    state.retrieved_docs = (
-                        []
-                    )  # Ensure it's an empty list on unexpected response
-            except (HTTPException, Exception) as e:
-                error_msg = f"Error during Retriever Agent retrieval: {e.detail if isinstance(e, HTTPException) else str(e)}"
-                logger.error(error_msg)
-                state.errors.append(error_msg)
-                state.retrieved_docs = (
-                    []
-                )  # Ensure it's an empty list on retrieval error
+                pass
+            except Exception as e:
+                state.errors.append(f"Retriever indexing failed: {e}")
+                state.indexed = False
         else:
-            logger.warning(
-                "Skipping retrieval: No user text or indexing was skipped/failed."
-            )
-            state.retrieved_docs = (
-                []
-            )  # Ensure it's an empty list if retrieval is skipped
+            state.indexed = False
+            logger.info("Retriever: No new documents to index.")
 
-        return state
+        if state.user_text:
+            try:
+
+                pass
+            except Exception as e:
+                state.errors.append(f"Retriever retrieval failed: {e}")
+                state.retrieved_docs = []
+        else:
+            state.retrieved_docs = []
+    return state
 
 
 async def analysis_agent_node(state: MarketBriefState) -> MarketBriefState:
-    """Calls the Analysis Agent to compute portfolio/earnings analysis."""
+    if not state.market_data and not state.filings:
+        state.warnings.append(
+            "Analysis Agent Node: No market data or filings available. Skipping analysis."
+        )
+        state.analysis = None
+        return state
+
     async with httpx.AsyncClient() as client:
-        # Analysis agent requires market_data, filings, and portfolio.
-        # If market_data or filings are missing due to upstream errors,
-        # the analysis agent might fail or produce partial results.
-        # We should pass what we have and let the analysis agent handle its validation.
-        if not state.market_data or not state.filings:
-            warning_msg = "Skipping Analysis Agent: Missing market data or filings from previous steps."
-            logger.warning(warning_msg)
-            state.warnings.append(warning_msg)
-            state.analysis = None  # Ensure analysis is None if skipped
-            return state  # Return state without calling agent
 
-        # Example portfolio - ideally from config or user context
-        portfolio_example = {
-            "TSM": 0.12,
-        }  # Use tickers matching API agent
-        asia_tech_tickers_example = ["TSM"]
+        nlu_res = state.nlu_results if state.nlu_results else {}
+        region_label = nlu_res.get("region_effective", nlu_res.get("region", "Global"))
+        sector_label = nlu_res.get(
+            "sector_effective", nlu_res.get("sector", "Overall Portfolio")
+        )
 
-        # Prepare earnings data for analysis agent - need to map ticker -> List[record_dict]
-        earnings_for_analysis = {}
-        for ticker, filing_response in state.filings.items():
-            # The analysis agent expects the list of records directly as the value for the ticker
-            earnings_for_analysis[ticker] = filing_response.get("data", [])
+        if region_label == "Global" and (
+            sector_label == "Overall Portfolio" or sector_label == "Overall Market"
+        ):
+            target_label_for_analysis = "Overall Portfolio"
+        else:
+            target_label_for_analysis = (
+                f"{region_label.replace('USA', 'US')} {sector_label} Stocks".strip()
+            )
 
-        payload = {
-            "portfolio": portfolio_example,
-            "market_data": state.market_data,
-            "earnings_data": earnings_for_analysis,  # Pass the list of records
-            "asia_tech_tickers": asia_tech_tickers_example,
+        analysis_target_tickers = state.target_tickers_for_data_fetch
+
+        current_portfolio_weights = {
+            ticker: details["weight"] for ticker, details in EXAMPLE_PORTFOLIO.items()
         }
 
+        payload = {
+            "portfolio": current_portfolio_weights,
+            "market_data": state.market_data if state.market_data else {},
+            "earnings_data": (state.filings if state.filings else {}),
+            "target_tickers": analysis_target_tickers,
+            "target_label": target_label_for_analysis,
+        }
         try:
             response_data = await call_agent(
                 client, f"{AGENT_ANALYSIS_URL}/analyze", json_payload=payload
             )
 
-            # Analysis agent returns dict with "asia_tech_alloc", "yesterday_alloc", "earnings_surprises"
-            if (
-                "asia_tech_alloc" in response_data
-                and "earnings_surprises" in response_data
-            ):
-                state.analysis = response_data
-                logger.info("Analysis Agent successful.")
-            else:
-                error_msg = (
-                    f"Analysis Agent response missing expected keys: {response_data}"
-                )
-                logger.error(error_msg)
-                state.errors.append(error_msg)
-                # Optionally, raise if analysis is critical
-                # raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Analysis Agent failed.")
-
-        except (HTTPException, Exception) as e:
-            error_msg = f"Error calling Analysis Agent: {e.detail if isinstance(e, HTTPException) else str(e)}"
-            logger.error(error_msg)
-            state.errors.append(error_msg)
-            # Optionally, raise if analysis is critical
-            # raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=error_msg)
-
-        return state
+            state.analysis = response_data
+            logger.info(
+                f"Analysis Agent successful for '{response_data.get('target_label')}'."
+            )
+        except HTTPException as e:
+            state.errors.append(f"Analysis Agent Node failed: {e.detail}")
+            state.analysis = None
+    return state
 
 
 async def language_agent_node(state: MarketBriefState) -> MarketBriefState:
-    """Calls the Language Agent to generate the brief."""
+
     async with httpx.AsyncClient() as client:
-        # Language agent requires user_text, analysis, and retrieved_docs.
-        # It can likely proceed even if docs or analysis are missing/empty,
-        # but user_text is critical.
-        if not state.user_text:
-            error_msg = "Skipping Language Agent: No user text available from STT."
-            logger.error(error_msg)
-            state.errors.append(error_msg)
-            state.brief = "Could not process your request as speech-to-text failed."
-            return state  # Return state with failure message
+        if not state.user_text or "Error:" in state.user_text:
+            state.errors.append("Language Agent: Skipping due to no valid user text.")
+            state.brief = (
+                "I could not understand your query or there was an earlier error."
+            )
+            return state
 
-        # Ensure analysis and retrieved_docs are not None, even if empty lists/dicts
-        analysis_data = state.analysis if state.analysis is not None else {}
-        retrieved_docs = (
-            state.retrieved_docs if state.retrieved_docs is not None else []
-        )
+        analysis_payload_for_llm: Dict[str, Any]
+        if state.analysis and isinstance(state.analysis, dict):
 
-        # The Language Agent expects the analysis data in a specific structure
-        # Use the refined Pydantic model structure from the Language Agent's `BriefRequest`
+            analysis_payload_for_llm = {
+                "target_label": state.analysis.get("target_label", "the portfolio"),
+                "current_allocation": state.analysis.get("current_allocation", 0.0),
+                "yesterday_allocation": state.analysis.get("yesterday_allocation", 0.0),
+                "allocation_change_percentage_points": state.analysis.get(
+                    "allocation_change_percentage_points", 0.0
+                ),
+                "earnings_surprises_for_target": state.analysis.get(
+                    "earnings_surprises_for_target", []
+                ),
+            }
+        else:
+            logger.warning(
+                "Language Agent: Analysis data is missing or not a dict. Using defaults."
+            )
+            state.warnings.append(
+                "Language Agent: Analysis data unavailable, brief will be general."
+            )
+            analysis_payload_for_llm = {
+                "target_label": "the portfolio (analysis data missing)",
+                "current_allocation": 0.0,
+                "yesterday_allocation": 0.0,
+                "allocation_change_percentage_points": 0.0,
+                "earnings_surprises_for_target": [],
+            }
+
         payload = {
             "user_query": state.user_text,
-            "analysis": analysis_data,  # Ensure this matches Language Agent's AnalysisData model
-            "retrieved_docs": retrieved_docs,
+            "analysis": analysis_payload_for_llm,
+            "retrieved_docs": state.retrieved_docs if state.retrieved_docs else [],
         }
-
         try:
             response_data = await call_agent(
                 client, f"{AGENT_LANGUAGE_URL}/generate_brief", json_payload=payload
             )
-
-            if "brief" in response_data:
-                state.brief = response_data["brief"]
-                logger.info(
-                    f"Language Agent successful. Brief generated: {state.brief[:100]}..."
-                )
-            else:
-                error_msg = f"Language Agent response missing 'brief': {response_data}"
-                logger.error(error_msg)
-                state.errors.append(error_msg)
-                state.brief = (
-                    state.brief or "Failed to generate brief text."
-                )  # Keep previous brief if exists or set fallback
-
-        except (HTTPException, Exception) as e:
-            error_msg = f"Error calling Language Agent: {e.detail if isinstance(e, HTTPException) else str(e)}"
-            logger.error(error_msg)
-            state.errors.append(error_msg)
-            state.brief = (
-                state.brief or "Failed to generate brief text due to an error."
-            )
-
-        return state
+            state.brief = response_data.get("brief")
+            logger.info(f"Language Agent successful. Brief: {state.brief[:70]}...")
+        except HTTPException as e:
+            state.errors.append(f"Language Agent Node failed: {e.detail}")
+            state.brief = "Sorry, I couldn't generate the brief at this time due to an internal error."
+    return state
 
 
 async def tts_node(state: MarketBriefState) -> MarketBriefState:
-    """Calls the Voice Agent for Text-to-Speech."""
-    async with httpx.AsyncClient() as client:
-        # TTS requires the brief. If language agent failed, we can't generate speech.
-        brief_text = state.brief
-        if (
-            not brief_text or len(state.errors) > 0
-        ):  # Also check if there are errors that might make the brief unreliable
-            warning_msg = (
-                "Skipping TTS: No brief text available or previous errors exist."
-            )
-            logger.warning(warning_msg)
-            state.warnings.append(warning_msg)
-            # Optionally, generate a generic error brief TTS
-            if len(state.errors) > 0:
-                error_brief = (
-                    "An error occurred during the market brief generation process."
-                )
-                try:
-                    payload = {"text": error_brief, "lang": "en"}
-                    response_data = await call_agent(
-                        client, f"{AGENT_VOICE_URL}/tts", json_payload=payload
-                    )
-                    if "audio" in response_data:
-                        state.audio_output = bytes.fromhex(response_data["audio"])
-                        logger.info("Generated TTS for error message.")
-                    else:
-                        logger.error(
-                            "TTS agent failed to return audio for error message."
-                        )
-                except (HTTPException, Exception) as e:
-                    logger.error(f"Failed to generate error brief TTS: {e}")
-                # Regardless of error brief success, mark main audio as None
-                state.audio_output = None
-            else:
-                state.audio_output = None  # No brief and no specific error brief
-            return state
 
-        payload = {"text": brief_text, "lang": "en"}
+    brief_text_for_tts = state.brief
+    if state.errors and (
+        not state.brief
+        or "sorry" in state.brief.lower()
+        or "error" in state.brief.lower()
+    ):
+
+        error_count = len(state.errors)
+        brief_text_for_tts = f"I encountered {error_count} error{'s' if error_count > 1 else ''} while processing your request. Please check the detailed report."
+        logger.warning(
+            f"TTS Node: Generating audio for error summary due to {error_count} errors in state."
+        )
+    elif not state.brief:
+        brief_text_for_tts = "The market brief could not be generated."
+        logger.warning("TTS Node: No brief text available from language agent.")
+        state.warnings.append("TTS Node: No brief content to synthesize.")
+
+    if not brief_text_for_tts:
+        state.audio_output = None
+        return state
+
+    async with httpx.AsyncClient() as client:
+        payload = {"text": brief_text_for_tts, "lang": "en"}
         try:
             response_data = await call_agent(
                 client, f"{AGENT_VOICE_URL}/tts", json_payload=payload
             )
-
-            # The TTS agent returns {"audio": hex_string}
             if "audio" in response_data and isinstance(response_data["audio"], str):
-                try:
-                    state.audio_output = bytes.fromhex(response_data["audio"])
-                    logger.info("TTS successful. Audio bytes received.")
-                except ValueError:
-                    error_msg = "TTS Agent returned invalid hex string."
-                    logger.error(error_msg)
-                    state.errors.append(error_msg)
-                    state.audio_output = None  # Ensure audio is None on hex error
+                state.audio_output = bytes.fromhex(response_data["audio"])
+                logger.info("TTS successful. Audio bytes received.")
             else:
-                error_msg = (
-                    f"TTS Agent response missing or invalid 'audio': {response_data}"
+                state.errors.append(
+                    f"TTS Agent response missing or invalid 'audio': {str(response_data)[:100]}"
                 )
-                logger.error(error_msg)
-                state.errors.append(error_msg)
-                state.audio_output = (
-                    None  # Ensure audio is None on response structure error
-                )
-
-        except (HTTPException, Exception) as e:
-            error_msg = f"Error calling TTS Agent: {e.detail if isinstance(e, HTTPException) else str(e)}"
-            logger.error(error_msg)
-            state.errors.append(error_msg)
-            state.audio_output = None  # Ensure audio is None on call error
-
-        return state
-
-
-# ---- LangGraph Workflow ----
+                state.audio_output = None
+        except HTTPException as e:
+            state.errors.append(f"TTS Node failed: {e.detail}")
+            state.audio_output = None
+    return state
 
 
 def build_market_brief_graph():
-    """Builds the LangGraph StateGraph for the market brief workflow."""
     builder = StateGraph(MarketBriefState)
-
-    # Add nodes
     builder.add_node("stt", stt_node)
+    builder.add_node("nlu", nlu_node)
     builder.add_node("api_agent", api_agent_node)
     builder.add_node("scraping_agent", scraping_agent_node)
     builder.add_node("retriever_agent", retriever_agent_node)
@@ -544,100 +531,86 @@ def build_market_brief_graph():
     builder.add_node("language_agent", language_agent_node)
     builder.add_node("tts", tts_node)
 
-    # Define the sequence
     builder.set_entry_point("stt")
-    builder.add_edge("stt", "api_agent")
+    builder.add_edge("stt", "nlu")
+    builder.add_edge("nlu", "api_agent")
     builder.add_edge("api_agent", "scraping_agent")
-    # Note: Retriever depends on scraping, analysis depends on api & scraping.
-    # Langgraph allows this structure implicitly.
     builder.add_edge("scraping_agent", "retriever_agent")
     builder.add_edge("retriever_agent", "analysis_agent")
     builder.add_edge("analysis_agent", "language_agent")
     builder.add_edge("language_agent", "tts")
-    builder.add_edge("tts", END)  # Use END constant
-
-    # No explicit error handling edges defined here, nodes raise exceptions or add errors to state.
-    # LangGraph default behavior is to propagate exceptions, stopping the graph run.
-    # The FastAPI endpoint will catch the HTTPException raised by call_agent or nodes.
-
+    builder.add_edge("tts", END)
     return builder.compile()
 
 
-# Build the graph instance
 graph = build_market_brief_graph()
-
-# ---- FastAPI Endpoint ----
 
 
 @app.post("/market_brief")
 async def market_brief(audio: UploadFile = File(...)):
-    """
-    Processes an audio input to generate a spoken market brief.
-    """
+
     logger.info("Received request to /market_brief")
     if not audio.content_type or not audio.content_type.startswith("audio/"):
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail="Invalid file type. Please upload an audio file.",
+            detail="Invalid file type.",
         )
 
-    # Initialize state with audio input
-    initial_state = MarketBriefState()
+    current_run_state = MarketBriefState()
     try:
-        initial_state.audio_input = await audio.read()
-        logger.info(f"Read {len(initial_state.audio_input)} bytes of audio input.")
+        current_run_state.audio_input = await audio.read()
     except Exception as e:
-        error_msg = f"Failed to read audio file: {e}"
-        logger.error(error_msg)
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=error_msg
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to read audio: {e}",
         )
 
-    # Invoke the LangGraph workflow
-    final_state = (
-        initial_state  # Initialize final_state in case graph invocation fails early
-    )
+    processed_state: MarketBriefState = current_run_state
+
     try:
-        # The graph will process the state through the nodes
-        final_state = await graph.ainvoke(initial_state)
-        logger.info("LangGraph execution finished.")
+        logger.info("Invoking LangGraph workflow...")
+
+        initial_state_dict = current_run_state.model_dump(exclude_none=True)
+        invocation_result = await graph.ainvoke(initial_state_dict)
+
+        if isinstance(invocation_result, dict):
+
+            processed_state = MarketBriefState(**invocation_result)
+            logger.info("LangGraph execution finished. State updated.")
+        else:
+            logger.error(
+                f"LangGraph ainvoke returned unexpected type: {type(invocation_result)}. Using partially updated state."
+            )
+
+            processed_state.errors.append(
+                f"Internal graph error: result type {type(invocation_result)}"
+            )
 
     except HTTPException as e:
-        # Catch HTTPExceptions specifically raised by call_agent or nodes
-        logger.error(f"Graph execution stopped due to HTTPException: {e.detail}")
-        # You might want to return a generic error response here
-        raise e  # Re-raise the caught HTTPException
-
-    except Exception as e:
-        # Catch any other unexpected errors during graph execution
-        error_msg = f"An unexpected error occurred during graph execution: {e}"
-        logger.error(error_msg)
-        # Return a generic server error
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=error_msg
+        logger.error(
+            f"Graph execution stopped due to HTTPException from an agent: {e.detail}"
         )
+        processed_state.errors.append(f"Agent call failed: {e.detail}")
+    except Exception as e:
+        error_msg = f"An unexpected error occurred during graph execution: {e}"
+        logger.error(error_msg, exc_info=True)
+        processed_state.errors.append(error_msg)
 
-    # Prepare the final response based on the final state
     response_payload = {
-        "transcript": final_state.user_text,
-        "brief": final_state.brief,
+        "transcript": processed_state.user_text,
+        "brief": processed_state.brief,
         "audio": (
-            final_state.audio_output.hex() if final_state.audio_output else None
-        ),  # Return hex string or None
-        "errors": final_state.errors,
-        "warnings": final_state.warnings,
-        "status": "success" if not final_state.errors else "failed",
-        "message": (
-            "Market brief generated successfully."
-            if not final_state.errors
-            else "Market brief generation failed with errors."
+            processed_state.audio_output.hex() if processed_state.audio_output else None
         ),
+        "errors": processed_state.errors,
+        "warnings": processed_state.warnings,
+        "status": "success" if not processed_state.errors else "failed",
+        "message": "Market brief process completed."
+        + (" With errors." if processed_state.errors else " Successfully."),
+        "nlu_detected": processed_state.nlu_results,
+        "analysis_details": processed_state.analysis,
     }
-
-    # Return 500 if there were errors accumulated in the state
-    if final_state.errors:
-        logger.error("Request finished with errors.")
-        return response_payload  # Return payload even with errors for debugging
-
-    logger.info("Request finished successfully.")
+    logger.info(
+        f"Request finished. Status: {response_payload['status']}. Errors: {len(response_payload['errors'])}. Warnings: {len(response_payload['warnings'])}."
+    )
     return response_payload

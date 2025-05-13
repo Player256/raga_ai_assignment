@@ -1,0 +1,144 @@
+version: '3.8'
+
+services:
+  api_agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.fastapi
+    command: uvicorn agents.api_agent:app --host 0.0.0.0 --port 8001 --reload
+    volumes:
+      - .:/app # Mount current directory to /app in container for live reload (dev)
+    ports:
+      - "8001:8001"
+    environment:
+      - FMP_API_KEY=${FMP_API_KEY}
+      - ALPHAVANTAGE_API_KEY=${ALPHAVANTAGE_API_KEY}
+    # depends_on:
+      # - some_database # If it had dependencies
+    networks:
+      - agent_network
+
+  scraping_agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.fastapi
+    command: uvicorn agents.scraping_agent:app --host 0.0.0.0 --port 8002 --reload
+    volumes:
+      - .:/app
+    ports:
+      - "8002:8002"
+    environment:
+      - FMP_API_KEY=${FMP_API_KEY}
+    networks:
+      - agent_network
+
+  retriever_agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.fastapi
+    command: uvicorn agents.retriever_agent:app --host 0.0.0.0 --port 8003 --reload
+    volumes:
+      - .:/app
+      - faiss_index_volume:/app/faiss_index_store # Persistent volume for FAISS index
+    ports:
+      - "8003:8003"
+    environment:
+      # No specific API keys for retriever itself, but FAISS_INDEX_PATH is used internally
+      - FAISS_INDEX_PATH=/app/faiss_index_store # Path inside the container
+    networks:
+      - agent_network
+
+  analysis_agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.fastapi
+    command: uvicorn agents.analysis_agent:app --host 0.0.0.0 --port 8004 --reload
+    volumes:
+      - .:/app
+    ports:
+      - "8004:8004"
+    # No specific env vars needed by this agent directly from .env
+    networks:
+      - agent_network
+
+  language_agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.fastapi
+    command: uvicorn agents.language_agent:app --host 0.0.0.0 --port 8005 --reload
+    volumes:
+      - .:/app
+    ports:
+      - "8005:8005"
+    environment:
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY} # Or OPENAI_API_KEY if you switch back
+      - GEMINI_MODEL_NAME=${GEMINI_MODEL_NAME:-gemini-1.5-flash-latest}
+    networks:
+      - agent_network
+
+  voice_agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.fastapi
+    command: uvicorn agents.voice_agent:app --host 0.0.0.0 --port 8006 --reload
+    volumes:
+      - .:/app
+    ports:
+      - "8006:8006"
+    environment:
+      - WHISPER_MODEL_SIZE=${WHISPER_MODEL_SIZE:-small}
+    networks:
+      - agent_network
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile.fastapi
+    command: uvicorn orchestrator.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - .:/app # Mount for development reload
+      - ./example_portfolio.json:/app/example_portfolio.json # Mount example data
+    ports:
+      - "8000:8000" # Expose orchestrator port to host
+    environment:
+      # URLs for other agents, using service names (Docker DNS will resolve these)
+      - AGENT_API_URL=http://api_agent:8001
+      - AGENT_SCRAPING_URL=http://scraping_agent:8002
+      - AGENT_RETRIEVER_URL=http://retriever_agent:8003
+      - AGENT_ANALYSIS_URL=http://analysis_agent:8004
+      - AGENT_LANGUAGE_URL=http://language_agent:8005
+      - AGENT_VOICE_URL=http://voice_agent:8006
+    depends_on: # Ensure agents start before orchestrator (loosely)
+      - api_agent
+      - scraping_agent
+      - retriever_agent
+      - analysis_agent
+      - language_agent
+      - voice_agent
+    networks:
+      - agent_network
+
+  streamlit_app:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    command: streamlit run streamlit/app.py --server.port=8501 --server.address=0.0.0.0 --browser.gatherUsageStats=false
+    volumes:
+      - ./streamlit:/app/streamlit # Mount for development reload of streamlit code
+      - ./example_portfolio.json:/app/example_portfolio.json # Mount example data
+    ports:
+      - "8501:8501" # Expose Streamlit port to host
+    environment:
+      - ORCHESTRATOR_URL=http://orchestrator:8000 # Streamlit app calls orchestrator via its service name
+      # If streamlit needs other env vars from .env, pass them here
+    depends_on:
+      - orchestrator
+    networks:
+      - agent_network
+
+volumes:
+  faiss_index_volume: # Define the named volume for FAISS index
+
+networks:
+  agent_network: # Define a custom bridge network
+    driver: bridge

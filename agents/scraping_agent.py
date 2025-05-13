@@ -1,28 +1,26 @@
-# agents/scraping_agent/main.py (Modified)
 import requests
 from fastapi import FastAPI, HTTPException, Query, status
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 
-# Import the loader function
+
 from data_ingestion.scraping_loader import (
     get_earnings_surprises,
     FMPError,
-)  # Import custom error
+)
 import logging
 
-# Configure logging
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Scraping Agent (FMP Earnings)")
 
-
 class FilingRequest(BaseModel):
     ticker: str
-    filing_type: Optional[str] = "earnings_surprise"  # Matches supported type
-    start_date: Optional[str] = None  # Not directly used by current loader
-    end_date: Optional[str] = None  # Not directly used by current loader
+    filing_type: Optional[str] = "earnings_surprise"
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
 
 
 @app.post("/get_filings")
@@ -37,19 +35,17 @@ def get_filings(request: FilingRequest):
         )
 
     try:
-        # Call the loader function from data_ingestion
+
         earnings_data_list = get_earnings_surprises(request.ticker)
 
-        # The loader handles API calls and basic error checking.
-        # The agent now just formats the response structure.
         return {
             "ticker": request.ticker,
             "filing_type": request.filing_type,
-            "data": earnings_data_list,  # This is the list returned by the loader
+            "data": earnings_data_list,
         }
 
     except (requests.exceptions.RequestException, FMPError) as e:
-        # Catch exceptions raised by the loader
+
         error_msg = f"Error fetching filings for {request.ticker}: {e}"
         logger.error(error_msg)
         raise HTTPException(

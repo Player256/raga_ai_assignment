@@ -1,36 +1,24 @@
-# streamlit_app/app.py
-
 import streamlit as st
 import httpx
 import os
 import io
-import base64
 from dotenv import load_dotenv
 import logging
-import asyncio  # Import asyncio to explicitly run async tasks if needed (though Streamlit handles top-level async)
+import asyncio
+from streamlit_mic_recorder import mic_recorder
 
-# Configure logging
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-# Load environment variables
 load_dotenv()
 
-# Get orchestrator URL from environment
 ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL")
-if not ORCHESTRATOR_URL:
-    st.error(
-        "ORCHESTRATOR_URL environment variable not set! Please add it to your .env file."
-    )
-    st.stop()  # Stop the app if the URL is not configured
 
-# Initialize session state variables if they don't exist
+
 if "processing_state" not in st.session_state:
-    st.session_state.processing_state = (
-        "initial"  # 'initial', 'processing', 'completed', 'error'
-    )
+    st.session_state.processing_state = "initial"
 if "orchestrator_response" not in st.session_state:
     st.session_state.orchestrator_response = None
 if "audio_bytes_input" not in st.session_state:
@@ -39,37 +27,32 @@ if "audio_filename" not in st.session_state:
     st.session_state.audio_filename = None
 if "audio_filetype" not in st.session_state:
     st.session_state.audio_filetype = None
-
-
-# --- Async Helper Function to Call Orchestrator ---
+if "last_audio_source" not in st.session_state:
+    st.session_state.last_audio_source = None
+if "current_recording_id" not in st.session_state:
+    st.session_state.current_recording_id = None
 
 
 async def call_orchestrator(audio_bytes: bytes, filename: str, content_type: str):
-    """Calls the orchestrator's /market_brief endpoint with audio data."""
+
     url = f"{ORCHESTRATOR_URL}/market_brief"
     files = {"audio": (filename, audio_bytes, content_type)}
-
-    logger.info(f"Calling orchestrator at {url} with audio file: {filename}")
-
+    logger.info(
+        f"Calling orchestrator at {url} with audio file: {filename} ({content_type})"
+    )
     try:
-        # Use httpx.AsyncClient for making async requests
         async with httpx.AsyncClient() as client:
-            response = await client.post(
-                url, files=files, timeout=180.0
-            )  # Increased timeout for potential long workflows
-            response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
+            response = await client.post(url, files=files, timeout=180.0)
+            response.raise_for_status()
             logger.info(f"Orchestrator returned status {response.status_code}.")
             return response.json()
-
     except httpx.RequestError as e:
         error_msg = f"HTTP Request failed: {e}"
         logger.error(error_msg)
-        # Return a structured error response compatible with the expected output
         return {
             "status": "error",
-            "message": "Error communicating with the orchestrator.",
+            "message": "Error communicating with orchestrator.",
             "errors": [error_msg],
-            "warnings": [],
             "transcript": None,
             "brief": None,
             "audio": None,
@@ -77,187 +60,284 @@ async def call_orchestrator(audio_bytes: bytes, filename: str, content_type: str
     except Exception as e:
         error_msg = f"An unexpected error occurred: {e}"
         logger.error(error_msg)
-        # Return a structured error response
         return {
             "status": "error",
             "message": "An unexpected error occurred.",
             "errors": [error_msg],
-            "warnings": [],
             "transcript": None,
             "brief": None,
             "audio": None,
         }
 
 
-# --- Main Streamlit App Logic ---
-
+st.set_page_config(layout="wide")
 st.title("📈 AI Financial Assistant - Morning Market Brief")
 st.markdown(
-    "Upload an audio file with your query (e.g., 'What's our risk exposure in Asia tech stocks today, and highlight any earnings surprises?')"
+    "Ask your query verbally (e.g., 'What's our risk exposure in Asia tech stocks today, and highlight any earnings surprises?') "
+    "or upload an audio file."
 )
 
-# File uploader - clears previous results when a new file is uploaded
-uploaded_file = st.file_uploader(
-    "Upload Audio File",
-    type=["wav", "mp3", "m4a", "ogg"],
-    help="Supported formats: WAV, MP3, M4A, OGG",
-    on_change=lambda: st.session_state.update(
-        processing_state="initial", orchestrator_response=None
-    ),  # Reset state on new upload
+input_method = st.radio(
+    "Choose input method:",
+    ("Record Audio", "Upload File"),
+    horizontal=True,
+    index=0,
+    key="input_method_radio",
 )
 
-# Store uploaded file info in session state
-if uploaded_file is not None:
-    st.session_state.audio_bytes_input = uploaded_file.getvalue()
-    st.session_state.audio_filename = uploaded_file.name
-    st.session_state.audio_filetype = uploaded_file.type
-    # Display file details and a preview if needed
-    # st.write("File uploaded:", uploaded_file.name)
-    # st.audio(st.session_state.audio_bytes_input, format=st.session_state.audio_filetype) # Optional preview
+audio_data_ready = False
 
-# Button to trigger the workflow
-# Disable button if no file is uploaded or if currently processing
+
+if st.session_state.audio_bytes_input is not None:
+    audio_data_ready = True
+
+
+if input_method == "Record Audio":
+    st.subheader("Record Your Query")
+
+    if st.session_state.last_audio_source == "uploader":
+        st.session_state.audio_bytes_input = None
+        st.session_state.audio_filename = None
+        st.session_state.audio_filetype = None
+        st.session_state.last_audio_source = "recorder"
+        audio_data_ready = False
+
+    audio_info = mic_recorder(
+        start_prompt="⏺️ Start Recording",
+        stop_prompt="⏹️ Stop Recording",
+        just_once=False,
+        use_container_width=True,
+        format="wav",
+        key="mic_recorder_widget",
+    )
+
+    if audio_info and audio_info.get("bytes"):
+
+        if st.session_state.current_recording_id != audio_info.get("id"):
+            st.session_state.current_recording_id = audio_info.get("id")
+            st.success("Recording complete! Click 'Generate Market Brief' below.")
+            st.session_state.audio_bytes_input = audio_info["bytes"]
+            st.session_state.audio_filename = f"live_recording_{audio_info['id']}.wav"
+            st.session_state.audio_filetype = "audio/wav"
+            st.session_state.last_audio_source = "recorder"
+            audio_data_ready = True
+            st.session_state.processing_state = "initial"
+            st.session_state.orchestrator_response = None
+            st.audio(audio_info["bytes"])
+
+        elif st.session_state.audio_bytes_input:
+            audio_data_ready = True
+            st.audio(st.session_state.audio_bytes_input)
+
+    elif (
+        st.session_state.last_audio_source == "recorder"
+        and st.session_state.audio_bytes_input
+    ):
+        st.markdown("Using last recording:")
+        st.audio(st.session_state.audio_bytes_input)
+        audio_data_ready = True
+
+
+elif input_method == "Upload File":
+    st.subheader("Upload Audio File")
+
+    if st.session_state.last_audio_source == "recorder":
+        st.session_state.audio_bytes_input = None
+        st.session_state.audio_filename = None
+        st.session_state.audio_filetype = None
+        st.session_state.last_audio_source = "uploader"
+        st.session_state.current_recording_id = None
+        audio_data_ready = False
+
+    if "uploaded_file_state" not in st.session_state:
+        st.session_state.uploaded_file_state = None
+
+    uploaded_file = st.file_uploader(
+        "Select Audio File",
+        type=["wav", "mp3", "m4a", "ogg", "flac"],
+        key="file_uploader_key",
+    )
+
+    if uploaded_file is not None:
+        if st.session_state.uploaded_file_state != uploaded_file:
+            st.session_state.uploaded_file_state = uploaded_file
+            st.session_state.audio_bytes_input = uploaded_file.getvalue()
+            st.session_state.audio_filename = uploaded_file.name
+            st.session_state.audio_filetype = uploaded_file.type
+            st.session_state.last_audio_source = "uploader"
+            audio_data_ready = True
+            st.session_state.processing_state = "initial"
+            st.session_state.orchestrator_response = None
+            st.success(f"File '{uploaded_file.name}' ready.")
+            st.audio(
+                st.session_state.audio_bytes_input,
+                format=st.session_state.audio_filetype,
+            )
+        elif st.session_state.audio_bytes_input:
+            audio_data_ready = True
+            st.audio(
+                st.session_state.audio_bytes_input,
+                format=st.session_state.audio_filetype,
+            )
+
+    elif (
+        st.session_state.last_audio_source == "uploader"
+        and st.session_state.audio_bytes_input
+    ):
+        st.markdown("Using last uploaded file:")
+        st.audio(
+            st.session_state.audio_bytes_input, format=st.session_state.audio_filetype
+        )
+        audio_data_ready = True
+
+
+st.divider()
 button_disabled = (
-    st.session_state.audio_bytes_input is None
-    or st.session_state.processing_state == "processing"
+    not audio_data_ready or st.session_state.processing_state == "processing"
 )
 
-if st.button("Generate Market Brief", disabled=button_disabled):
-    # Button click initiates the processing state
-    st.session_state.processing_state = "processing"
-    st.session_state.orchestrator_response = None  # Clear previous response
-    st.rerun()  # Rerun the script to enter the processing block
+if st.button(
+    "Generate Market Brief",
+    disabled=button_disabled,
+    type="primary",
+    use_container_width=True,
+    key="generate_button",
+):
+    if st.session_state.audio_bytes_input:
+        st.session_state.processing_state = "processing"
+        st.session_state.orchestrator_response = None
+        logger.info(
+            f"Generate Market Brief button clicked. Source: {st.session_state.last_audio_source}, Filename: {st.session_state.audio_filename}"
+        )
+        st.rerun()
+    else:
+        st.warning("Please record or upload an audio query first.")
 
-
-# --- Processing Logic based on State ---
 
 if st.session_state.processing_state == "processing":
-    st.info("Processing your request...")
-    # Perform the async call and await it
-    # Streamlit handles awaiting top-level async calls in the script.
-    # We call a sync wrapper around our async function here to make it work directly in this part of the script.
-    # A more robust way in complex apps is to use separate async tasks or components.
-    # For a simple demo, directly awaiting here often works in recent Streamlit versions.
-    # Let's simplify and rely on Streamlit's async handling here.
-    try:
-        response = asyncio.run(
-            call_orchestrator(
-                st.session_state.audio_bytes_input,
-                st.session_state.audio_filename,
-                st.session_state.audio_filetype,
+    if (
+        st.session_state.audio_bytes_input
+        and st.session_state.audio_filename
+        and st.session_state.audio_filetype
+    ):
+        with st.spinner("Processing your request... This may take a moment. 🤖"):
+
+            logger.info(
+                f"Calling orchestrator with filename: {st.session_state.audio_filename}, type: {st.session_state.audio_filetype}, bytes: {len(st.session_state.audio_bytes_input)}"
             )
-        )
-        st.session_state.orchestrator_response = response
-        st.session_state.processing_state = (
-            "completed" if response and response.get("status") != "error" else "error"
-        )
+            try:
+                response = asyncio.run(
+                    call_orchestrator(
+                        st.session_state.audio_bytes_input,
+                        st.session_state.audio_filename,
+                        st.session_state.audio_filetype,
+                    )
+                )
+                st.session_state.orchestrator_response = response
 
-    except Exception as e:
-        logger.error(f"Error during orchestrator call in Streamlit: {e}")
-        st.session_state.orchestrator_response = {
-            "status": "error",
-            "message": f"Streamlit failed to call orchestrator: {e}",
-            "errors": [str(e)],
-            "warnings": [],
-            "transcript": None,
-            "brief": None,
-            "audio": None,
-        }
-        st.session_state.processing_state = "error"
-    # Rerun the script to display results based on the new state
-    st.rerun()
+                is_successful_response = True
+                if not response:
+                    is_successful_response = False
+                elif (
+                    response.get("status") == "error"
+                    or response.get("status") == "failed"
+                ):
+                    is_successful_response = False
+                elif response.get("errors") and len(response.get("errors")) > 0:
+                    is_successful_response = False
 
+                st.session_state.processing_state = (
+                    "completed" if is_successful_response else "error"
+                )
 
-# --- Display Results based on State ---
+            except Exception as e:
+                logger.error(
+                    f"Error during orchestrator call in Streamlit: {e}", exc_info=True
+                )
+                st.session_state.orchestrator_response = {
+                    "status": "error",
+                    "message": f"Streamlit failed to call orchestrator: {str(e)}",
+                    "errors": [str(e)],
+                    "transcript": None,
+                    "brief": None,
+                    "audio": None,
+                }
+                st.session_state.processing_state = "error"
+        st.rerun()
+    else:
+        st.error("Audio data is missing for processing. Please record or upload again.")
+        st.session_state.processing_state = "initial"
+
 
 if st.session_state.processing_state in ["completed", "error"]:
+
     response = st.session_state.orchestrator_response
-    st.subheader("Results")
+    st.subheader("📝 Results")
 
     if response is None:
         st.error("No response received from the orchestrator.")
-    elif response.get("status") == "error":
-        st.error(f"Workflow Failed: {response.get('message', 'Unknown error')}")
+
+    elif (
+        response.get("status") == "failed"
+        or response.get("status") == "error"
+        or (response.get("errors") and len(response.get("errors")) > 0)
+    ):
+        st.error(
+            f"Workflow {response.get('status', 'failed')}: {response.get('message', 'Check errors below.')}"
+        )
         if response.get("errors"):
-            st.warning("Details:")
+            st.warning("Details of Errors:")
             for i, err in enumerate(response["errors"]):
-                st.write(f"- Error {i+1}: {err}")
+                st.markdown(f"`Error {i+1}`: {err}")
         if response.get("warnings"):
-            st.warning("Warnings:")
+            st.warning("Details of Warnings:")
             for i, warn in enumerate(response["warnings"]):
-                st.write(f"- Warning {i+1}: {warn}")
+                st.markdown(f"`Warning {i+1}`: {warn}")
 
-    else:  # status is likely 'success' or similar
-        # Display Transcript
-        st.subheader("Transcript")
-        transcript = response.get("transcript", "N/A")
-        st.write(transcript)
+        if response.get("transcript"):
+            st.markdown("---")
+            st.markdown("Transcript (despite errors):")
+            st.caption(response.get("transcript"))
+        if response.get("brief"):
+            st.markdown("---")
+            st.markdown("Generated Brief (despite errors):")
+            st.caption(response.get("brief"))
+    else:
+        st.success(response.get("message", "Market brief generated successfully!"))
+        if response.get("transcript"):
+            st.markdown("---")
+            st.markdown("Your Query (Transcript):")
+            st.caption(response.get("transcript"))
+        else:
+            st.info("Transcript not available.")
 
-        # Display Brief Text
-        st.subheader("Generated Brief")
-        brief_text = response.get("brief", "N/A")
-        st.write(brief_text)
+        if response.get("brief"):
+            st.markdown("---")
+            st.markdown("Generated Brief:")
+            st.write(response.get("brief"))
+        else:
+            st.info("Brief text not available.")
 
-        # Play Audio Brief
         audio_hex = response.get("audio")
         if audio_hex:
-            st.subheader("Audio Brief")
+            st.markdown("---")
+            st.markdown("Audio Brief:")
             try:
-                # Ensure the hex string is valid
                 if not isinstance(audio_hex, str) or not all(
                     c in "0123456789abcdefABCDEF" for c in audio_hex
                 ):
-                    raise ValueError("Invalid hex string received.")
-
+                    raise ValueError("Invalid hex string for audio.")
                 audio_bytes_output = bytes.fromhex(audio_hex)
-                audio_io = io.BytesIO(audio_bytes_output)
-                # Assuming gTTS outputs MP3
-                st.audio(audio_io, format="audio/mpeg")
-                logger.info("Displayed audio player.")
+                st.audio(audio_bytes_output, format="audio/mpeg")
             except ValueError as ve:
-                st.error(f"Failed to decode audio data: {ve}")
-                logger.error(f"Failed to decode audio data from hex string: {ve}")
+                st.error(f"⚠️ Failed to decode audio data: {ve}")
             except Exception as e:
-                st.error(f"Failed to play audio: {e}")
-                logger.error(f"Error playing audio: {e}")
+                st.error(f"⚠️ Failed to play audio: {e}")
         else:
-            st.warning("No audio brief generated (or audio data missing in response).")
+            st.info("Audio brief not available.")
 
-        # Display Errors and Warnings if any were accumulated in the state
-        errors = response.get("errors", [])
-        warnings = response.get("warnings", [])
-
-        if errors:
-            st.subheader("Errors Reported During Processing")
-            for i, err in enumerate(errors):
-                st.error(f"Error {i+1}: {err}")
-
-        if warnings:
-            st.subheader("Warnings Reported During Processing")
-            for i, warn in enumerate(warnings):
-                st.warning(f"Warning {i+1}: {warn}")
-
-
-# Optional: Add instructions on how to run the app
-st.markdown("---")
-st.markdown("#### To Run This Application Locally:")
-st.markdown("1. Ensure your `.env` file is in the project root and configured.")
-st.markdown(
-    "2. Start all agent services (api, scraping, retriever, analysis, language, voice) in separate terminals using the correct `uvicorn agents.<module_name>:app --reload --port <port>` commands from the project root."
-)
-st.markdown(
-    "3. Start the orchestrator service using `uvicorn orchestrator.main:app --reload --port 8000` (or your configured port)."
-)
-st.markdown("4. Run the Streamlit app from the project root:")
-st.code("streamlit run streamlit_app/app.py")
-st.markdown("5. Open the provided URL in your browser.")
-
-# Optional: Add a simple session state clear button for easy re-runs during development
-if st.button("Clear Session State & Results"):
-    # Reset all session state variables
-    st.session_state.processing_state = "initial"
-    st.session_state.orchestrator_response = None
-    st.session_state.audio_bytes_input = None
-    st.session_state.audio_filename = None
-    st.session_state.audio_filetype = None
-    st.rerun()  # Rerun the app to clear the display
+        if response.get("warnings"):
+            st.markdown("---")
+            st.warning("Process Warnings:")
+            for i, warn in enumerate(response["warnings"]):
+                st.markdown(f"`Warning {i+1}`: {warn}")

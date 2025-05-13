@@ -1,1 +1,6 @@
 .env    
+agents/__pycache__/*
+data_ingestion/__pycache__/*
+faiss_index_store
+orchestrator/__pycache__
+
